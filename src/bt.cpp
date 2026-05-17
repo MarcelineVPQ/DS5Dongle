@@ -18,6 +18,7 @@
 #include "config.h"
 #include "state_mgr.h"
 #include "pico/util/queue.h"
+#include "slots.h"
 
 #define MTU_CONTROL 672
 #define MTU_INTERRUPT 672
@@ -50,8 +51,94 @@ struct send_element {
 
 absolute_time_t inactive_time = 0; // 手柄长时间静默
 
+// Multi-slot pairing state. Modeled on zurce/DS5Dongle-OLED.
+static int g_current_slot = 0;
+
+bool bt_disconnect();  // fwd decl — defined further down
+
+// Keep the dongle discoverable while at least one slot is empty (covers
+// initial setup + partial-wipe states). Once all 4 slots are full, go
+// non-discoverable so a stray phone can't try to pair.
+static void update_discoverable() {
+    if (slots_any_empty()) {
+        gap_discoverable_control(1);
+    } else {
+        gap_discoverable_control(0);
+    }
+}
+
 void bt_register_data_callback(bt_data_callback_t callback) {
     bt_data_callback = callback;
+}
+
+// ---- OLED add-on + multi-slot accessors --------------------------------
+
+bool bt_is_connected() { return hid_interrupt_cid != 0; }
+
+void bt_get_addr(uint8_t out[6]) { memcpy(out, current_device_addr, 6); }
+
+uint32_t bt_hci_err_count() { return 0; }  // stub for OLED Diagnostics
+
+int bt_get_slot() { return g_current_slot; }
+
+void bt_set_slot(int slot) {
+    if (slot < 0 || slot >= kNumSlots) return;
+    if (slot == g_current_slot) return;
+    g_current_slot = slot;
+
+    Config_body cfg = get_config();
+    cfg.current_slot = (uint8_t)slot;
+    set_config(cfg);
+    config_save();
+
+    if (bt_is_connected()) {
+        // DISCONNECTION_COMPLETE will restart inquiry under the new filter.
+        bt_disconnect();
+    } else {
+        gap_inquiry_stop();
+        gap_inquiry_start(30);
+    }
+    update_discoverable();
+}
+
+bool bt_slot_occupied(int slot) { return slot_occupied(slot); }
+void bt_slot_get_addr(int slot, uint8_t out[6]) { slot_get_addr(slot, out); }
+
+void bt_forget_slot(int slot) {
+    if (slot < 0 || slot >= kNumSlots) return;
+    if (slot_occupied(slot)) {
+        uint8_t addr[6];
+        slot_get_addr(slot, addr);
+        gap_drop_link_key_for_bd_addr(addr);
+    }
+    slot_forget(slot);
+    update_discoverable();
+    if (slot == g_current_slot && bt_is_connected()) {
+        bt_disconnect();
+    }
+}
+
+void bt_wipe_all_slots() {
+    btstack_link_key_iterator_t it;
+    if (gap_link_key_iterator_init(&it)) {
+        bd_addr_t snapshot[16];
+        int n = 0;
+        bd_addr_t addr;
+        link_key_t key;
+        link_key_type_t type;
+        while (n < 16 && gap_link_key_iterator_get_next(&it, addr, key, &type)) {
+            bd_addr_copy(snapshot[n++], addr);
+        }
+        gap_link_key_iterator_done(&it);
+        for (int i = 0; i < n; i++) {
+            gap_drop_link_key_for_bd_addr(snapshot[i]);
+        }
+    }
+    slots_wipe_all();
+    update_discoverable();
+    if (bt_is_connected()) {
+        bt_disconnect();
+    }
 }
 
 void bt_send_packet(uint8_t *data, uint16_t len) {
@@ -102,6 +189,13 @@ void bt_l2cap_init() {
 int bt_init() {
     queue_init(&send_fifo, sizeof(send_element), 10);
 
+    // Load persistent slot table BEFORE HCI comes up so the inquiry filter
+    // and discoverable-gating see the right state on the first event.
+    slots_load();
+    g_current_slot = get_config().current_slot;
+    if (g_current_slot < 0 || g_current_slot >= kNumSlots) g_current_slot = 0;
+    printf("[BT] Boot slot = %d\n", g_current_slot);
+
     bt_l2cap_init();
 
     // SSP (Secure Simple Pairing)
@@ -111,7 +205,7 @@ int bt_init() {
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
 
     gap_connectable_control(1);
-    gap_discoverable_control(1);
+    update_discoverable();
 
     hci_event_callback_registration.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
@@ -169,6 +263,24 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 
             // CoD 0x002508 = Gamepad (Major: Peripheral, Minor: Gamepad)
             if ((cod & 0x000F00) == 0x000500) {
+                // Slot-ownership filter: skip devices owned by a different slot;
+                // if our slot is occupied, only accept its exact bd_addr.
+                // Unowned devices pair into the current slot if it's empty.
+                const int owner = slot_owner_of(addr);
+                if (owner >= 0 && owner != g_current_slot) {
+                    printf("[HCI] Gamepad %s belongs to slot %d, skip (cur=%d)\n",
+                           bd_addr_to_str(addr), owner, g_current_slot);
+                    break;
+                }
+                if (slot_occupied(g_current_slot)) {
+                    uint8_t want[6];
+                    slot_get_addr(g_current_slot, want);
+                    if (memcmp(want, addr, 6) != 0) {
+                        printf("[HCI] Slot %d wants different addr, skip %s\n",
+                               g_current_slot, bd_addr_to_str(addr));
+                        break;
+                    }
+                }
                 printf("[HCI] Gamepad found: %s (CoD: 0x%06x)\n", bd_addr_to_str(addr), (unsigned int) cod);
                 bd_addr_copy(current_device_addr, addr);
                 device_found = true;
@@ -191,7 +303,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 printf("[HCI] Restart inquiry\n");
                 gap_inquiry_start(30);
                 gap_connectable_control(1);
-                gap_discoverable_control(1);
+                update_discoverable();
             }
             break;
         }
@@ -332,7 +444,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             tud_disconnect();
 #endif
             gap_connectable_control(1);
-            gap_discoverable_control(1);
+            update_discoverable();
             const uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
             device_found = false;
             new_pair = false;
@@ -432,6 +544,14 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     printf("[L2CAP] HID Control opened cid=0x%04X\n", local_cid);
                     hid_control_cid = local_cid;
 
+                    // First-time pairing: assign this bd_addr to the current slot.
+                    if (!slot_occupied(g_current_slot)) {
+                        slot_assign(g_current_slot, current_device_addr);
+                        printf("[Slots] Assigned %s to slot %d\n",
+                               bd_addr_to_str(current_device_addr), g_current_slot);
+                        update_discoverable();
+                    }
+
                     const auto mtu = l2cap_get_remote_mtu_for_local_cid(hid_control_cid);
                     printf("[L2CAP] Remote Control MTU: %d\n",mtu);
                 } else if (psm == PSM_HID_INTERRUPT) {
@@ -458,8 +578,9 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     const auto mtu = l2cap_get_remote_mtu_for_local_cid(hid_interrupt_cid);
                     printf("[L2CAP] Remote Interrupt MTU: %d\n",mtu);
 
-                    gap_connectable_control(false);
-                    gap_discoverable_control(false);
+                    // OLED Edition: keep discoverable rule centralized — discoverable
+                    // when any slot is empty, dark otherwise.
+                    update_discoverable();
                     // tud_connect();
                 } else {
                     printf("[L2CAP] Unknown Channel psm: 0x%02X", psm);
