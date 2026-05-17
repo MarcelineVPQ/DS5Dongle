@@ -109,3 +109,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" artifacts/*.uf2 --clobber
+
+      # Notify the web config repo so its GH Pages deploy rebuilds and
+      # bundles this fresh UF2 into the site. If the WEB_REPO_DISPATCH_PAT
+      # secret isn't configured on this repo, the dispatch call fails 401
+      # and continue-on-error swallows it — the web app keeps serving the
+      # previously-bundled UF2 until its own deploy is manually triggered.
+      - name: Trigger web config rebuild
+        continue-on-error: true
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.WEB_REPO_DISPATCH_PAT }}
+          repository: MarcelineVPQ/DS5Dongle-OLED-Config-Web
+          event-type: firmware-released
+          client-payload: '{"tag": "${{ github.event.release.tag_name }}", "title": "${{ github.event.release.name }}"}'
