@@ -10,6 +10,9 @@
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/watchdog.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "cmd.h"
 #include "pico/time.h"
 
 extern uint8_t interrupt_in_data[63]; // defined in main.cpp
@@ -70,10 +73,11 @@ constexpr int kScreenTriggers  = 3;
 constexpr int kScreenGyro      = 4;
 constexpr int kScreenTouchpad  = 5;
 constexpr int kScreenDiag      = 6;
-constexpr int kScreenRssi      = 7;
-constexpr int kScreenVU        = 8;
-constexpr int kScreenSettings  = 9;
-constexpr int kNumScreens      = 10;
+constexpr int kScreenCpu       = 7;
+constexpr int kScreenRssi      = 8;
+constexpr int kScreenVU        = 9;
+constexpr int kScreenSettings  = 10;
+constexpr int kNumScreens      = 11;
 int current_screen = 0;
 
 // Lightbar mode cycle: 0=LIVE, 1-4=FAV0-3, 5=BREATHING, 6=RAINBOW, 7=FADE
@@ -598,6 +602,60 @@ __attribute__((noinline)) void render_screen_diag() {
 
     draw_text(0, 56, "K0=next K1=back");
 
+    flush_fb();
+}
+
+__attribute__((noinline)) void render_screen_cpu(bool entered) {
+    fb_clear();
+    draw_text(0, 0, "CPU / Clock");
+
+    char buf[24];
+
+    // Configured system clock — compile-time SYS_CLOCK_KHZ, set in main()
+    // via set_sys_clock_khz(). This is the *target*.
+    const uint32_t set_khz = (uint32_t)SYS_CLOCK_KHZ;
+    snprintf(buf, sizeof(buf), "Set : %lu MHz", (unsigned long)(set_khz / 1000u));
+    draw_text(0, 12, buf);
+
+    // Actually running clk_sys, measured by the on-chip frequency counter
+    // against the crystal reference (not just what we asked for). The counter
+    // busy-waits a few ms per call, so measure ONCE on screen entry and cache
+    // it — clk_sys is fixed at boot and never changes, so the temperature
+    // (which legitimately drifts) is the only thing worth refreshing per
+    // frame. cached_real_khz==0 also forces a (re)measure as a safety net.
+    static uint32_t cached_real_khz = 0;
+    if (entered || cached_real_khz == 0) {
+        cached_real_khz = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS);
+    }
+    const uint32_t real_khz = cached_real_khz;
+    snprintf(buf, sizeof(buf), "Real: %lu.%01lu MHz",
+             (unsigned long)(real_khz / 1000u),
+             (unsigned long)((real_khz % 1000u) / 100u));
+    draw_text(0, 22, buf);
+
+    // Core voltage actually programmed into the regulator, read back (not the
+    // compile-time constant). Codes 0..15 are linear 0.05 V steps from 0.55 V.
+    const int vcode = (int)vreg_get_voltage();
+    if (vcode >= 0 && vcode <= 0b01111) {
+        const unsigned mv = 550u + 50u * (unsigned)vcode;
+        snprintf(buf, sizeof(buf), "Vcore: %u.%02u V", mv / 1000u, (mv % 1000u) / 10u);
+    } else {
+        snprintf(buf, sizeof(buf), "Vcore: code %d", vcode);
+    }
+    draw_text(0, 32, buf);
+
+    // RP2350 on-die temperature sensor. Smoothed + averaged in cmd.cpp
+    // (single source of truth shared with the 0xfc web telemetry) so the
+    // reading converges to the true die temp instead of chasing ADC noise.
+    const uint16_t raw = cpu_temp_raw_smoothed();
+    const float volts = (float)raw * 3.3f / 4096.0f;
+    const float temp_c = 27.0f - (volts - 0.706f) / 0.001721f;
+    const int t10 = (int)(temp_c * 10.0f + (temp_c >= 0 ? 0.5f : -0.5f));
+    snprintf(buf, sizeof(buf), "Temp : %d.%d C", t10 / 10,
+             (t10 < 0 ? -t10 : t10) % 10);
+    draw_text(0, 42, buf);
+
+    draw_text(0, 56, "K0=next K1=back");
     flush_fb();
 }
 
@@ -1204,6 +1262,13 @@ void oled_loop() {
     const bool idle = (now - last_activity_us) > kAutoDimUs;
     sh1107_set_contrast(idle ? kDimContrast : kBrightLevels[bright_idx]);
 
+    // True on the first render after navigating to a different screen.
+    // Lets a screen do expensive one-shot work on entry (the CPU screen
+    // caches its frequency-counter measurement here).
+    static int last_rendered_screen = -1;
+    const bool screen_entered = (current_screen != last_rendered_screen);
+    last_rendered_screen = current_screen;
+
     switch (current_screen) {
         case kScreenStatus:   render_screen();           break;
         case kScreenSlots:    render_screen_slots();     break;
@@ -1212,6 +1277,7 @@ void oled_loop() {
         case kScreenGyro:     render_screen_gyro();      break;
         case kScreenTouchpad: render_screen_touchpad();  break;
         case kScreenDiag:     render_screen_diag();      break;
+        case kScreenCpu:      render_screen_cpu(screen_entered); break;
         case kScreenRssi:     render_screen_rssi();      break;
         case kScreenVU:       render_screen_vu();        break;
         case kScreenSettings: render_screen_settings();  break;
