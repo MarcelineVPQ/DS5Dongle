@@ -126,14 +126,15 @@ constexpr int kLbModeHost = 8;
 constexpr int kNumLbModes = 9;
 
 // Settings screen state
-constexpr int kNumSettingsItems = 15; // 8 fields + 3 auto-haptic + 2 screen-timeout + Reset + Wipe
+constexpr int kNumSettingsItems = 16; // 8 fields + 3 auto-haptic + 2 screen-timeout + BT mic + Reset + Wipe
 constexpr int kSettingsAutoHapEnaIdx  = 8;
 constexpr int kSettingsAutoHapGainIdx = 9;
 constexpr int kSettingsAutoHapLpIdx   = 10;
 constexpr int kSettingsScrDimIdx      = 11;
 constexpr int kSettingsScrOffIdx      = 12;
-constexpr int kSettingsResetIdx       = 13;
-constexpr int kSettingsWipeSlotsIdx   = 14;
+constexpr int kSettingsBtMicIdx       = 13;
+constexpr int kSettingsResetIdx       = 14;
+constexpr int kSettingsWipeSlotsIdx   = 15;
 Config_body settings_local{};
 int settings_sel = 0;
 bool settings_dirty = false;
@@ -1416,6 +1417,7 @@ void settings_adjust(int delta) {
             c.screen_off_timeout = (uint8_t)v;
             break;
         }
+        case 13: c.bt_mic_enable ^= 1; break; // BT mic on/off
     }
 }
 
@@ -1517,8 +1519,9 @@ __attribute__((noinline)) void format_settings_item(int idx, char* line, size_t 
             if (c.screen_off_timeout == 0) snprintf(line, n, "%s ScrOff off", cur);
             else snprintf(line, n, "%s ScrOff %umin", cur, c.screen_off_timeout);
             break;
-        case 13: snprintf(line, n, "%s Reset to defaults", cur); break;
-        case 14: snprintf(line, n, "%s Wipe all slots", cur); break;
+        case 13: snprintf(line, n, "%s BT Mic %s", cur, c.bt_mic_enable ? "on" : "off"); break;
+        case 14: snprintf(line, n, "%s Reset to defaults", cur); break;
+        case 15: snprintf(line, n, "%s Wipe all slots", cur); break;
     }
 }
 

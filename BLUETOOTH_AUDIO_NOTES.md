@@ -1,77 +1,37 @@
-# Bluetooth microphone investigation — current status
+# Bluetooth microphone — SOLVED
 
-**TL;DR:** The DualSense's built-in microphone does **not** work when the controller is paired to this dongle over Bluetooth. It works fine when the controller is connected directly to a host over USB. This is a Sony / DS5-firmware-side limitation we currently can't work around without reverse engineering or BT-sniffer access to PS5 ↔ DS5 traffic. The same limitation is documented in the upstream Linux kernel driver (`drivers/hid/hid-playstation.c` line ~1509: *"Bluetooth audio is currently not supported"*).
+**TL;DR:** The DualSense's built-in microphone **works over this dongle's Bluetooth pairing** as of v0.6.8. It is decoded and presented to the host as the standard DualSense USB capture device. Earlier versions of this document concluded the opposite — that it was a Sony-side limitation, probably encrypted, a dead end. **That conclusion was wrong.** The whole thing hinged on a single enable bit. Full credit to **[awalol](https://github.com/awalol/DS5Dongle)** (upstream `mic` branch) for identifying it.
 
-This file is a hand-off / research log for the next person who tries.
+## How it works
 
-## What does work
+1. **Enable bit (dongle → DS5).** In the outbound `0x36` BT audio report, the audio-control sub-report's first flag byte (`pkt[4]`) has **bit 0 = mic-enable**. Setting it (`0b11111110` → `0b11111111`; bits 1–7 were already the speaker/haptic enables) tells the DS5 to start streaming its mic. See `src/audio.cpp`.
+2. **Mic frames (DS5 → dongle).** Once enabled, the DS5 tags certain `0x31` BT input reports as mic frames by setting **bit 1 of byte 2** (`(data[2] >> 1) & 1`); the payload is a **71-byte Opus packet at offset +4**. `src/main.cpp:on_bt_data()` routes those to `mic_add_queue()`.
+3. **Decode + present.** `src/audio.cpp` Opus-decodes each frame to mono 48 kHz (480-sample / 10 ms frames), duplicates mono → stereo, and `tud_audio_write`s it to the UAC1 capture endpoint. The host sees a normal DualSense mic.
+4. **Sticky.** Once the DS5 starts streaming it **keeps going for the rest of the session** even after the enable bit / audio output stops (verified: mic stays live with no further `0x36` frames).
+5. **Always-on.** Because the enable normally only rides the audio-gated `0x36` frames, the dongle sends a **control-only `0x36` keep-alive** (enable bit + `SetStateData` + silent haptic, no speaker payload) at ~4 Hz *only until mic frames start arriving*, then stops (sticky takes over). So the mic works with no game audio playing, at minimal extra BT traffic. See `mic_enable_keepalive()` in `src/audio.cpp`.
+6. **Toggle.** Gated by `Config_body.bt_mic_enable` (default on) — OLED **Settings → BT Mic** and the web config tool. Off = no enable sent, no keep-alive, and inbound mic frames are not routed (so it's off host-side even if a previously-enabled DS5 is still streaming). Off by toggle saves DS5 battery (always-on keeps its audio subsystem awake).
 
-- **Direct USB-C from DS5 → host:** mic enumerates as a UAC1 IN endpoint at 48 kHz / 16-bit / 2 channels on `EP 0x82`, max packet 196 bytes. ALSA recognizes it as `card N: Controller [DualSense Wireless Controller]`. `arecord` captures real audio after raising the `Headset Capture Volume` mixer control (it defaults to 0 dB).
-- **Our dongle's USB descriptor** correctly mirrors the DS5's UAC1 layout — same interfaces, same alt settings, same endpoint addresses, same packet sizes. Verified with `lsusb -v` against a real DS5.
-- **All the firmware-side decode infrastructure for BT mic is in place** (Opus decoder, `mic_fifo` queue, `tud_audio_write` to the IN endpoint, mono → stereo duplication) — see `src/audio.cpp`. It's currently gated behind `if (false)` in `src/main.cpp`'s `on_bt_data()` because we have nothing to feed it.
+## Why the original conclusion was wrong (the lesson)
 
-## What doesn't, and why
+The earlier investigation ported awalol's *receive* side (the `(data[2]>>1)&1` trigger + Opus decode) and then watched for that bit — but **never sent the enable bit**, because this fork's `audio.cpp` had diverged (the pre-`3a31bd7` SetStateData revert) and sat at `pkt[4] = 0b11111110`. With nothing telling the DS5 to start, it never streamed, so bit 1 of byte 2 never set — which got misread as "the trigger never fires → the channel must be encrypted / it's a dead end."
 
-The DS5 firmware on the test controller (build date `Jul 4 2025`, queried via feature report 0x20) **does not stream microphone audio over the standard BT-HID L2CAP channels** (PSM 0x11 control + 0x13 interrupt).
+It was never encrypted. It was one un-set bit on the *transmit* side. Lesson: when porting a two-sided protocol, confirm **both** halves (enable *and* receive) before concluding the device "can't" do something.
 
-What we tried:
+## What we use (host-side)
 
-1. **Upstream `awalol/DS5Dongle` `mic` branch as reference.** That branch claims to extract a 71-byte Opus packet at `data + 4` of any BT input report where `(data[2] >> 1) & 1` is set. On our DS5 firmware, **bit 1 of byte 2 is never set** (verified across thousands of frames via the `g_31_b2_or` OR mask). The upstream RE was likely done on a different (older) DS5 firmware revision.
-2. **Bit 0 of byte 2** matches roughly all standard input reports — confirmed by reading the supposed "mic prefix" via `0xFD` feature report and seeing live stick X/Y values (not Opus data). Not a mic flag.
-3. **Frame length sweep.** Longest BT 0x31 frame we ever see is 79 bytes — a fully-decoded standard DS5 input report (sticks + IMU + touchpad + battery + sensor timestamp + trailing zeros). No audio bytes appended anywhere.
-4. **Other report IDs.** Counted ALL incoming BT input reports by report ID. Only `0x01` (rare) and `0x31` (common). No 0x33 / 0x35 / 0x36 / 0x39 / etc. The DS5 isn't sending anything mic-shaped on a different ID.
-5. **State configuration matching the kernel.** Set `AllowAudioControl=1`, `AllowMicVolume=1`, `AllowAudioMute=1`, `MicSelect=Internal`, `VolumeMic=0x40`, `MicMute=0`, `AudioPowerSave=0` — exactly what `hid-playstation.c` sets when calling its "Enable microphone" path. DS5 still doesn't stream.
-6. **Bidirectional audio session hypothesis.** Maybe the DS5 only streams mic when there's also active speaker audio (`0x36` packets) flowing. Tested: ran `aplay /dev/zero` simultaneously with `arecord`. No change in BT-side counters, no new report IDs, no longer frames. Disproved.
-7. **State refresh on host UAC1 alt-setting change.** Considered hooking `tud_audio_set_itf_cb(itf=2, alt=1)` to send the DS5 a fresh "enable mic" state update. Not implemented — given the kernel comment and our state matching the kernel's own "enable" sequence, this wouldn't have helped.
+- **`scripts/mic_diag.sh`** — `status` / `capture [secs]` / `watch` / `bt-trace`. `capture` arecords the DualSense mic card and reports peak/RMS/non-zero, the fastest way to confirm real audio.
+- The DualSense capture card's **`Headset` capture control defaults low** — raise it (`amixer -c <card> sset 'Headset' 90%`) or captures look silent.
+- **OLED Diagnostics** `Mic in:` (~100/s when streaming) + `Mic dec=` (480 = good Opus decode) are the on-device confirmation.
+- Vendor HID feature reports `0xFD` / `0xFE` and the BT counters remain useful general audio-debug infra.
 
-What we **did not** try (real next steps if anyone picks this up):
+## Open follow-ups
 
-- **SDP browse the DS5** over BT after pairing. Discover what L2CAP PSMs / services it advertises beyond HID. If there's a Sony proprietary audio PSM we haven't subscribed to, that's where mic traffic might live.
-- **Open additional L2CAP channels** (proprietary audio PSM if found, or standard ones like A2DP=0x19 / RFCOMM=0x03) and watch for unsolicited inbound data.
-- **Compare DS5 firmware revisions.** Test with an older DS5 (pre-2024 manufacture) and see if it streams mic over BT — that would tell us whether Sony removed the feature or just nobody documented the protocol. (We only have one DS5; can't test.)
-- **BT sniffer** between a PS5 console and a DS5 during voice chat. Tells us exactly what L2CAP channels and bytes Sony uses for mic. Equipment-intensive (~$50–200 for an Ubertooth or commercial sniffer).
-- **DS5 firmware disassembly.** Legally fraught, almost certainly EULA-violating.
-
-## Strongest hypothesis: the channel is encrypted
-
-The shape of all the negative evidence — kernel maintainers giving up, no public RE project succeeding, our matching every documented "enable" bit and getting nothing — strongly suggests the channel is **encrypted with a session key derived during pairing**, not just transported on an undocumented PSM. Sony's incentives line up perfectly:
-
-- **PR / privacy:** a $40 third-party dongle routing a user's PS5 voice chat to a malicious host is a worst-case PR scenario. Encrypting the mic channel is the obvious defense.
-- **GDPR-class regulation:** voice biometrics from a console controller over plaintext BT is the kind of thing EU regulators ask hard questions about.
-- **Anti-spoofing:** prevents injecting fake mic data into a PS5 session, which is its own threat model.
-
-Mechanism that fits the evidence:
-
-- During pairing, BT Classic SSP produces a link key. The PS5 + DS5 firmware likely run a Sony-proprietary KDF on top of that link key to produce an audio-channel session key.
-- Mic audio is transported on a Sony-allocated proprietary L2CAP PSM (not in the standard BT-SIG ranges) and encrypted with that session key (AES-CCM or similar).
-- A third-party dongle could connect to the PSM if it knew the number, but without the KDF / session key the payload would be opaque encrypted blobs.
-
-**Implication:** a BT sniffer might tell us the PSM and packet timing/sizes, but not the payload contents. Building a PS5-impersonating dongle that derives valid session keys would require either Sony system-software disassembly or DS5 firmware disassembly — legally fraught, and a much bigger undertaking than what this project is set up for.
-
-This re-frames "we can't get mic over BT" from "we haven't tried hard enough" to "the architecture is intentionally hardened against exactly this." That's not nothing — it's a clear answer to give users who ask, and a clear bar to clear if anyone wants to actually pursue it.
-
-## What we built that's useful regardless
-
-These all stay shipped — they're general-purpose audio-debug infrastructure now:
-
-- **`scripts/mic_diag.sh`** with subcommands `status`, `capture [secs]`, `watch`, `bt-trace`. Drives the entire diagnostic loop from the host without needing OLED-relay-through-the-user; reads vendor feature reports via `/dev/hidraw`.
-- **Vendor HID feature report `0xFD`** (32 bytes): BT input-report counter, non-0x31 counter, last seen non-0x31 report ID, OR mask of byte 2 across 0x31 frames, length range, hex prefix of last frame.
-- **Vendor HID feature report `0xFE`** (82 bytes): full content of the longest 0x31 frame seen, for byte-level inspection.
-- **OLED Diagnostics screen** carries BT31/Mic rate + recent frame prefix + opus dec/wrote bytes — useful for any future audio-path debugging at the bench.
-- **`src/audio.cpp`** mic-decode infrastructure (Opus decoder on core0, FIFO, mono → stereo duplication, `tud_audio_write` to IN endpoint). Disabled at the `mic_add_queue` call site, ready to re-enable the moment a real mic trigger is identified.
-- **`src/state_mgr.cpp`** initial state corrected — `VolumeMic` was `0xff` (out of valid range per spec; max is `0x40`), `MuteControl` had all `*PowerSave` bits set which would have power-gated the audio DSP. These corrections don't enable BT mic but they're the right defaults regardless.
+- **No documented "stop" command.** Disabling mid-session relies on gating the receive side; the DS5 keeps streaming until reconnect. If a real stop/disable bit is found, wire it into the toggle to stop the DS5-side battery drain immediately.
+- **Mono only.** Decoded mono is duplicated to the stereo endpoint; the DS5 mic is mono so this is fine, but the descriptor could be made truly mono (as awalol's branch does) to halve endpoint bandwidth.
+- **Name the `pkt[4]` bits precisely.** `daidr/dualsense-tester`'s `outputStruct.ts` documents the *standard* output report flags but not the `0x36` BT-audio sub-report; the bit meanings beyond bit 0 are inferred from the working speaker/haptic path.
 
 ## References
 
-- Linux kernel `drivers/hid/hid-playstation.c`. Quoted lines: ~1407–1420 (mic enable/disable), ~1509 (*"Bluetooth audio is currently not supported"*). [Raw source on GitHub mirror](https://raw.githubusercontent.com/torvalds/linux/master/drivers/hid/hid-playstation.c).
-- PSDevWiki [DualSense HID Commands](https://www.psdevwiki.com/ps5/DualSense_HID_Commands) — has factory/manufacturer commands (report IDs 128, 129, 160, 164, 165) for BT patches and audio codec selection, but explicitly notes most "do not work with retail controllers". Not a path forward.
-- Upstream `awalol/DS5Dongle` branch `mic` (commits `9c197fc feat: mic work`, `3829163 mic mono channel`). RE'd a working mic path for an older DS5 firmware revision; we ported the data plumbing but the BT-side trigger differs on current firmware.
-- dualsensectl: `command_microphone on/off` sets `valid_flag0 |= DS_OUTPUT_VALID_FLAG0_AUDIO_CONTROL_ENABLE` and clears `DS_OUTPUT_POWER_SAVE_CONTROL_MIC_MUTE`. Same as what we already do on connect.
-
-## For users asking about the mic
-
-When users report "the mic doesn't work":
-
-- **Plug the DS5 into the host via USB.** Mic works out of the box. You may need to raise the `Headset Capture Volume` mixer control if it defaults to 0 dB.
-- **Over the dongle's Bluetooth pairing, the mic is currently a known limitation** — not something a firmware update on our side can fix without further reverse engineering of the DS5's proprietary BT audio path.
-- The diagnostic tools in `scripts/mic_diag.sh` are available if you want to help reverse engineer this; PRs welcome.
+- Upstream `awalol/DS5Dongle` branch `mic` (commits `9c197fc`, `3829163`) — the source of the enable bit (`pkt[4]` bit 0) and the receive-side decode. awalol confirmed bit 0 is the key.
+- Linux kernel `drivers/hid/hid-playstation.c` (~line 1509, *"Bluetooth audio is currently not supported"*) — still true for the kernel driver; not for this dongle.
+- `daidr/dualsense-tester` — `src/router/DualSense/views/_OutputPanel/outputStruct.ts` for the standard output-report flag layout.

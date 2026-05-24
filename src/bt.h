@@ -25,6 +25,11 @@ std::vector<uint8_t> get_feature_data(uint8_t reportId,uint16_t len);
 void init_feature();
 void set_feature_data(uint8_t reportId, uint8_t* data,uint16_t len);
 
+// Connection-attempt watchdog: call once per main-loop iteration. Recovers a
+// stalled connection (auto re-inquiry) so a transient RF glitch — e.g. USB 3.0
+// 2.4 GHz interference — doesn't hang the dongle on the amber lightbar.
+void bt_connection_watchdog_tick();
+
 // OLED add-on accessors.
 bool bt_is_connected();
 void bt_get_addr(uint8_t out[6]);

@@ -189,11 +189,24 @@ void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
         }
     }
 
-    // Mic-add tap DISABLED — was decoding standard input (button/stick
-    // bytes) as Opus and producing INT16_MIN garbage on the USB IN
-    // endpoint. Re-enable once we identify the actual mic transport.
-    // (Standard input handling below resumes — Status screen + HID
-    //  reports to host need this.)
+    // Mic-in tap (TEST): once the dongle asserts the mic-enable bit in the
+    // outgoing 0x36 audio report (pkt[4] bit 0, see audio.cpp — awalol
+    // confirmed this is the key), the DS5 streams its mic as a 71-byte Opus
+    // packet at data+4 of a 0x31 report with bit 1 of data[2] set. Route those
+    // to the mic decoder instead of treating them as a standard input report.
+    // The length guard (4-byte header + 71-byte Opus) keeps a stray short
+    // frame from over-reading. The diagnostic counters above still observe
+    // these frames, so the Diag screen's data[2] OR-mask will show bit 1 set
+    // once the enable bit takes effect.
+    // A mic-tagged 0x31 frame carries Opus audio at data+4, NOT a standard input
+    // report — so it must ALWAYS be diverted here (decoded when mic is on, dropped
+    // when off), never fall through to the input handler below. Letting it through
+    // would copy Opus bytes into interrupt_in_data and corrupt sticks/buttons.
+    if (channel == INTERRUPT && data[1] == 0x31 && ((data[2] >> 1) & 1)
+        && len >= 75) {
+        if (get_config().bt_mic_enable) mic_add_queue(data + 4);
+        return;
+    }
 
     if (channel == INTERRUPT && data[1] == 0x31) {
         if ((data[56] & 1) != (interrupt_in_data[53] & 1)) {
@@ -381,6 +394,7 @@ int main() {
         watchdog_update();
 #endif
         cyw43_arch_poll();
+        bt_connection_watchdog_tick();
         tud_task();
         audio_loop();
         interrupt_loop();

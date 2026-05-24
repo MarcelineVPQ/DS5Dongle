@@ -140,11 +140,43 @@ When the connected DualSense reports its battery at or below 10% (and it is not 
 
 To opt out at build time, configure with `-DENABLE_BATT_LED=OFF`. Default is ON.
 
+## DualSense Microphone over Bluetooth
+
+**The DualSense's built-in microphone works over the dongle's Bluetooth pairing** (since v0.6.8). The controller streams its mic as Opus audio; the dongle decodes it and presents it to the host as the standard DualSense USB capture device, so any app (Discord, OBS, in-game voice) can use it like a normal microphone.
+
+This was long believed impossible — earlier versions of this fork documented it as a hard Sony-firmware limitation (and the Linux `hid-playstation` kernel driver still doesn't support it). It turned out to hinge on a single enable bit in the dongle's outbound audio report. **Full credit to [awalol](https://github.com/awalol/DS5Dongle) (upstream) for identifying it.** The corrected investigation log lives in [BLUETOOTH_AUDIO_NOTES.md](./BLUETOOTH_AUDIO_NOTES.md).
+
+**Using it:**
+
+- **On by default.** Pair the controller and the mic begins streaming within a second or two — no game audio required (the dongle keeps the stream alive on its own).
+- **Raise the capture volume on the host** — it defaults low. On Linux, find the card with `arecord -l`, then e.g. `amixer -c <DualSense card> sset 'Headset' 90%`. Verify capture with `scripts/mic_diag.sh capture`.
+- **Toggle it off to save controller battery** — OLED **Settings → BT Mic**, or the **BT microphone** switch in the [web config tool](#web-config-tool). Always-on mic keeps the DS5's audio subsystem awake, which drains its battery noticeably faster, so disable it if you don't use voice.
+
+**Caveats:**
+
+- Mic audio is **mono** (decoded mono, duplicated across the stereo capture endpoint).
+- Toggling off mid-session stops the host feed immediately, but the controller keeps streaming until it next reconnects (there's no known "stop" command); connecting fresh with the toggle off never enables it.
+- The OLED **Diagnostics** screen's `Mic in:` counter reads ~100/s while the mic is streaming — a quick way to confirm it's live.
+
 ## Known Issues
 
 - Overclocking to 320 MHz @ 1.20 V is **required** for stable BT pairing. Dropping voltage to 1.10 V or clock to stock breaks the CYW43 PIO SPI bus and BT stops working. A small heatsink on the RP2350 is recommended for sustained gameplay.
 - HD haptics may not fire in every game on Linux + Steam; this is game-side (some titles only send HD-haptic audio under Windows-specific APIs). Tested working in Spider-Man Remastered; not delivered in Ghost of Tsushima — same firmware, same controller.
-- **DualSense microphone does not work over the Bluetooth pairing.** This is a Sony / DS5-firmware-side limitation also documented in the upstream Linux kernel driver (`drivers/hid/hid-playstation.c` line ~1509: *"Bluetooth audio is currently not supported"*). The mic works fine when the controller is connected directly to the host via USB-C. See [BLUETOOTH_AUDIO_NOTES.md](./BLUETOOTH_AUDIO_NOTES.md) for the full investigation log + what's already wired firmware-side if a future contributor cracks the BT-side trigger.
+- **USB 3.0 ports can disrupt pairing** — the controller may get stuck on a solid amber/yellow lightbar and never connect, while the same dongle works fine on a USB 2.0 port. This is RF interference, not a firmware bug; see [USB 3.0 ports & Bluetooth interference](#usb-30-ports--bluetooth-interference) below. (As of v0.6.8 the firmware auto-retries a stalled connection instead of hanging, which recovers many — but not all — marginal cases.)
+
+## USB 3.0 ports & Bluetooth interference
+
+If the dongle works on one port but not another, **try a USB 2.0 port first.** USB 3.0 ports and (especially) USB 3.0 extension cables emit broadband RF noise centered near 2.4 GHz — the same band the dongle's Bluetooth radio uses to talk to the controller. This is a well-documented industry issue (Intel, *"USB 3.0 Radio Frequency Interference Impact on 2.4 GHz Wireless Devices"*), not specific to this firmware. The noise desensitizes the dongle's BT receiver, so the controller can start connecting (amber lightbar) but the link is too noisy to complete — it hangs on yellow.
+
+Mitigations, roughly in order of effectiveness:
+
+1. **Plug the dongle into a USB 2.0 port** (often the simplest fix — many motherboards/cases have both).
+2. **Use a short USB 2.0 extension cable** to get the dongle a few inches away from the USB 3.0 ports / metal chassis, improving line-of-sight to the controller. Avoid USB 3.0 extension cables specifically.
+3. **Use a powered USB 2.0 hub** plugged into the USB 3.0 port — the hub downshifts the link and adds distance.
+4. **Clip a ferrite bead** onto the cable near the dongle.
+5. **Keep the controller closer / in line of sight** of the dongle during pairing.
+
+The firmware will keep retrying a stalled connection on its own, so leaving it plugged in for ~10–20 s after the lightbar goes amber may let it recover without a replug.
 
 ## Performance / Overclocking
 

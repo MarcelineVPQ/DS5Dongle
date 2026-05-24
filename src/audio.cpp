@@ -13,6 +13,7 @@
 #include "utils.h"
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
+#include "pico/time.h"
 #include "config.h"
 #include "state_mgr.h"
 #include "usb.h"
@@ -114,6 +115,46 @@ void mic_add_queue(const uint8_t *data) {
     queue_try_add(&mic_fifo, &packet);
 }
 
+// Re-assert the DS5 mic-enable (pkt[4] bit 0) so the controller streams its mic
+// even when no audio is being output to it. Normally the enable only rides the
+// 0x36 audio frames, which are gated on active USB audio — so without this, mic
+// only works while a game plays sound. The enable is sticky (the DS5 keeps
+// streaming once it starts), so we send a control-only 0x36 (enable + the
+// load-bearing SetStateData sub-report + a silent haptic block, no speaker
+// payload → makes no sound) at ~4 Hz ONLY until mic frames start arriving, then
+// stop — minimizing BT traffic and DS5 battery. Resumes if the stream stalls.
+static void mic_enable_keepalive() {
+    if (!bt_is_connected() || !get_config().bt_mic_enable) return;
+    const uint64_t now = time_us_64();
+    static uint32_t last_frames = 0;
+    static uint64_t last_frame_us = 0;
+    static uint64_t last_send_us = 0;
+    const uint32_t frames = g_mic_frames;
+    if (frames != last_frames) { last_frames = frames; last_frame_us = now; }
+    if (last_frame_us != 0 && (now - last_frame_us) < 1000000ULL) return; // streaming → sticky, no resend
+    if (last_send_us != 0 && (now - last_send_us) < 250000ULL) return;    // throttle to ~4 Hz while arming
+    last_send_us = now;
+
+    uint8_t pkt[REPORT_SIZE]{};
+    pkt[0] = REPORT_ID;
+    pkt[1] = reportSeqCounter << 4;
+    reportSeqCounter = (reportSeqCounter + 1) & 0x0F;
+    pkt[2] = 0x11 | 1 << 7;
+    pkt[3] = 7;
+    pkt[4] = 0b11111111; // mic-enable (bit 0)
+    const auto buf_len = get_config().audio_buffer_length;
+    pkt[5] = pkt[6] = pkt[7] = pkt[8] = pkt[9] = buf_len;
+    pkt[10] = packetCounter++;
+    pkt[11] = 0x10 | 1 << 7; // SetStateData sub-report (load-bearing — keeps actuators alive)
+    pkt[12] = 63;
+    state_set(pkt + 13, 63);
+    pkt[76] = 0x12 | 1 << 7;  // haptic sub-report; samples left zero = silent
+    pkt[77] = SAMPLE_SIZE;
+    // no speaker sub-report (pkt[142..] stays zero) → control-only, no audio out
+    bt_write(pkt, sizeof(pkt));
+    g_bt_packets++;
+}
+
 void audio_loop() {
     // Mic-in path: pull one Opus packet from the BT-side FIFO, decode to
     // mono PCM, duplicate to stereo (our UAC1 endpoint declares 2 channels),
@@ -142,7 +183,16 @@ void audio_loop() {
     }
 
     // 1. 读取 USB 音频数据
-    if (!tud_audio_available()) return;
+    if (!tud_audio_available()) {
+        // Keep the DS5 mic streaming even without output audio — but ONLY once
+        // the host has enumerated us (tud_mounted). Running it during the
+        // fresh-pair feature handshake floods BT TX and delays controller-type
+        // detection past the connection watchdog's timeout, which then tears the
+        // link down (~10-15s "shutdown" on fresh pair). After enumeration the
+        // handshake is done, so it's safe — and always-on mic still works.
+        if (tud_mounted()) mic_enable_keepalive();
+        return;
+    }
 
     int16_t raw[192];
     uint32_t bytes_read = tud_audio_read(raw, sizeof(raw)); // 每次读入 384 bytes
@@ -276,7 +326,10 @@ void audio_loop() {
         reportSeqCounter = (reportSeqCounter + 1) & 0x0F;
         pkt[2] = 0x11 | 0 << 6 | 1 << 7;
         pkt[3] = 7;
-        pkt[4] = 0b11111110;
+        // bit 0 = mic-enable: tells the DS5 to stream its mic over BT (awalol
+        // confirmed this is the key). Bits 1-7 are the pre-existing speaker/
+        // haptic audio-enable flags. Gated on the bt_mic_enable config toggle.
+        pkt[4] = get_config().bt_mic_enable ? 0b11111111 : 0b11111110;
         const auto buf_len = get_config().audio_buffer_length;
         pkt[5] = buf_len;
         pkt[6] = buf_len;

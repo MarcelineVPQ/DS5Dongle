@@ -39,6 +39,11 @@ struct __attribute__((packed)) Config_body {
     // idle timer is 64-bit µs so the full range is representable. Issue #5.
     uint8_t screen_dim_timeout;
     uint8_t screen_off_timeout;
+    // DualSense mic over Bluetooth (Phase I). 0 = off, 1 = on (default). When on,
+    // the dongle asserts the DS5 mic-enable bit so the controller streams its mic
+    // over BT and the dongle decodes it to the USB capture endpoint. Costs extra
+    // DS5 battery (keeps its audio subsystem awake), hence the toggle.
+    uint8_t bt_mic_enable;
 };
 
 struct __attribute__((packed)) Config {

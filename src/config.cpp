@@ -109,6 +109,10 @@ void config_valid() {
         body->screen_off_timeout = 15;    // mirrors the original 15-min off tier
         printf("[Config] screen_off_timeout invalid, defaulting to 15 min\n");
     }
+    if (body->bt_mic_enable > 1) {        // 0xFF erased / upgrade → default ON
+        body->bt_mic_enable = 1;
+        printf("[Config] bt_mic_enable invalid, defaulting to 1 (on)\n");
+    }
     if (body->config_version != CONFIG_VERSION) {
         body->config_version = CONFIG_VERSION;
         printf("[Config] Warning: Config may breaking change\n");
